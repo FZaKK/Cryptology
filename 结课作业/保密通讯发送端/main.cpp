@@ -1,0 +1,890 @@
+#include <iostream>
+#include <iomanip>
+#include <string>
+#include <cstring>
+#include <stdlib.h>
+#include <fstream>
+#include "AES.h"
+#include "RSA.h"
+
+#include<WinSock2.h>
+#include<WS2tcpip.h>
+#include<thread>
+#pragma comment(lib,"ws2_32.lib")
+
+#define DEFAULT_IP "127.0.0.1"
+#define DEFAULT_PORT 27015
+#define DEFAULT_BUFLEN 4096
+#define MES_LEN sizeof(TCP_Message)
+#define MAX_FILESIZE 1024 * 1024 * 10
+//#define _WINSOCK_DEPRECATED_NO_WARNINGS 1  //VS2015后启用旧函数
+
+using namespace std;
+
+int flag = 1;
+unsigned int user_name = 0; // 随机生成的0-99的随机数，用于分发密钥的验证
+long file_size = 0; // 每次发送文件的大小
+const unsigned int START = 0;
+const unsigned int SENDING = 1;
+const unsigned int OVER = 2;
+const unsigned int SPECIAL = 4; // 特殊情形使用，这里用于获取文件大小
+const unsigned int KEY = 5;
+
+
+class TCP_Message {
+public:
+	int send_state;
+	int user;
+	SYSTEMTIME timestamp;
+	char buffer[DEFAULT_BUFLEN] = ""; // 加密数据
+public:
+	TCP_Message();
+	TCP_Message(unsigned int state, unsigned int user_name, SYSTEMTIME time);
+	TCP_Message(unsigned int state, unsigned int user_name, SYSTEMTIME time, string data_segment);
+	void set_value(unsigned int state, unsigned int user_name, SYSTEMTIME time, char* data_segment, int size);  // 这里一定要注意
+};
+
+TCP_Message::TCP_Message() {
+	send_state = -1;
+	user = -1;
+	timestamp = { 0 };
+}
+
+TCP_Message::TCP_Message(unsigned int state, unsigned int user_name, SYSTEMTIME time) {
+	send_state = state;
+	user = user_name;
+	timestamp = time;
+}
+
+TCP_Message::TCP_Message(unsigned int state, unsigned int user_name, SYSTEMTIME time, string data_segment) {
+	send_state = state;
+	user = user_name;
+	timestamp = time;
+	for (int i = 0; i < data_segment.length(); i++) {
+		buffer[i] = data_segment[i];
+	}
+	buffer[data_segment.length()] = '\0';
+}
+
+void TCP_Message::set_value(unsigned int state, unsigned int user_name, SYSTEMTIME time, char* data_segment, int size) {
+	send_state = state;
+	user = user_name;
+	timestamp = time;
+	memcpy(buffer, data_segment, size);
+}
+
+void print_Recv_information(TCP_Message& tcp2show) {
+	cout << "Recv Message " << endl;
+	cout << "user: " << tcp2show.user << endl;
+	cout << "state: " << tcp2show.send_state << endl;
+	cout << "time: ";
+	SYSTEMTIME temptime = tcp2show.timestamp;
+	cout << temptime.wYear << "年" << temptime.wMonth << "月" << temptime.wDay << "日";
+	cout << temptime.wHour << "时" << temptime.wMinute << "分" << temptime.wSecond << "秒" << endl;
+	cout << "-----------------------------------------------------" << endl;
+}
+
+// 目前都是在工作路径下操作，可以修改成“/测试文件/”
+// 待测试
+void recv_file(SOCKET& RecvSocket) {
+	char* file_content = new char[MAX_FILESIZE]; // 偷懒了，直接调大
+	string filename = "";
+	long size = 0;
+	int iResult = 0;
+	bool temp_flag = true;
+
+	while (temp_flag && flag == 1) {
+		char* RecvBuf = new char[MES_LEN]();
+		TCP_Message temp;
+		iResult = recv(RecvSocket, RecvBuf, MES_LEN, 0);
+		if (iResult == SOCKET_ERROR) {
+			cout << "Recv failed with error: " << WSAGetLastError() << endl;
+			flag = 0;
+		}
+		else {
+			memcpy(&temp, RecvBuf, MES_LEN);
+
+			if (temp.send_state == START) {
+				filename = temp.buffer;
+				cout << "*** 文件名：" << filename << endl;
+				print_Recv_information(temp);
+			}
+			else if (temp.send_state == OVER) {
+				// 怪怪的，文件传输的最后一个数据分组
+				memcpy(file_content + size, temp.buffer, file_size - size);
+				size += file_size - size; // ??
+
+				print_Recv_information(temp);
+
+				ofstream fout(filename, ofstream::binary);
+				fout.write(file_content, size); // 这里还是size,如果使用string.data或c_str的话图片不显示，经典深拷贝问题
+				fout.close();
+				temp_flag = false;
+
+				cout << "*** 文件大小：" << size << " bytes" << endl;
+				cout << "-----*** 成功接收文件 ***-----" << endl << endl;
+
+				cout << "请输入您的命令：";
+			}
+			// 处理文件的大小
+			else if (temp.send_state == SPECIAL) {
+				cout << temp.buffer << endl;
+				char* temp_str = temp.buffer;
+				int temp_int = atoi(temp_str);
+				file_size = temp_int;
+				cout << file_size << endl;
+
+				print_Recv_information(temp);
+			}
+			else {
+				memcpy(file_content + size, temp.buffer, DEFAULT_BUFLEN);
+				size += DEFAULT_BUFLEN;
+
+				print_Recv_information(temp);
+			}
+		}
+
+		delete[] RecvBuf; // 一定要delete掉啊，否则不给堆区了
+	}
+	delete[] file_content;
+}
+
+DWORD WINAPI Recv(LPVOID lparam_socket) {
+	int recvResult;
+	SOCKET* recvSocket = (SOCKET*)lparam_socket;  // 一定要使用指针型变量，因为要指向connect socket的位置
+
+	while (1) {
+		// cout << "**** Log **** " << endl;
+		if (flag == 1) {
+			cout << endl;
+			recv_file(*recvSocket);
+		}
+		else {
+			closesocket(*recvSocket);
+			return 1;
+		}
+	}
+}
+
+// 返回值设成ERROR_CODE试试，要使用memcpy把整体发过去
+void send_packet(TCP_Message& Packet, SOCKET& SendSocket) {
+	int iResult;
+	char* SendBuf = new char[MES_LEN];
+
+	memcpy(SendBuf, &Packet, MES_LEN);
+	iResult = send(SendSocket, SendBuf, MES_LEN, 0);
+	if (iResult == SOCKET_ERROR) {
+		cout << "Sendto failed with error: " << WSAGetLastError() << endl;
+	}
+
+	if (Packet.send_state == START) {
+		cout << "开始传输文件..." << endl;
+	}
+	else if (Packet.send_state == SENDING) {
+		cout << "正在传输文件..." << endl;
+	}
+	else if (Packet.send_state == SPECIAL) {
+		cout << "传输文件大小..." << endl;
+	}
+	else if (Packet.send_state == KEY) {
+		cout << "正在传输密钥..." << endl;
+	}
+	else {
+		cout << "传输文件结束..." << endl;
+	}
+
+	delete[] SendBuf;
+}
+
+// 待测试，发送线程的发送文件
+void send_file(string filename, SOCKET& SendSocket) {
+	ifstream fin(filename.c_str(), ifstream::binary);
+
+	// 获取文件大小
+	fin.seekg(0, std::ifstream::end);
+	long size = fin.tellg();
+	file_size = size;
+	fin.seekg(0);
+	char* binary_file_buf = new char[size];
+	cout << " ** 文件大小：" << size << " bytes" << endl;
+	fin.read(&binary_file_buf[0], size);
+	fin.close();
+
+	// 加密数据，时间戳和用户 state->user->timestamp
+	// 第一个数据包要发送文件名，Header是不需要的
+	// 需要添加表征文件传输开始与结束的标志
+	SYSTEMTIME systime = { 0 };
+	GetLocalTime(&systime);
+	TCP_Message tcp_packets(START, user_name, systime, filename.c_str());
+
+	// 发送数据包的个数，以及数据包的size，可以对数据包进行RSA加密
+	int packet_num = size / DEFAULT_BUFLEN + 1;
+	cout << " ** 发送数据包的数量：" << packet_num << endl;
+
+	send_packet(tcp_packets, SendSocket);
+
+	// 发送文件的size
+	// 向接收端发送最后一个数据分组的大小
+	int temp = size;
+	cout << temp << endl;
+	string tempbuf = to_string(temp);
+	cout << tempbuf.c_str() << endl;
+	
+	GetLocalTime(&systime);
+	TCP_Message size_packets(SPECIAL, user_name, systime, tempbuf.c_str());
+	send_packet(size_packets, SendSocket);
+
+	// 包含第一个文件名以及START标志，最后一个数据包带OVER标志，分包的问题
+	for (int index = 0; index < packet_num; index++) {
+		if (index == packet_num - 1) {
+			GetLocalTime(&systime);
+			tcp_packets.set_value(OVER, user_name, systime, binary_file_buf + index * DEFAULT_BUFLEN, size - index * DEFAULT_BUFLEN); // ?？
+		}
+		else {
+			GetLocalTime(&systime);
+			tcp_packets.set_value(SENDING, user_name, systime, binary_file_buf + index * DEFAULT_BUFLEN, DEFAULT_BUFLEN);
+		}
+
+		// 不需要继续考虑丢包了
+		send_packet(tcp_packets, SendSocket);
+		cout << "user: " << tcp_packets.user << endl;
+		cout << "state: " << tcp_packets.send_state << endl;
+		cout << "time: ";
+		SYSTEMTIME temptime = tcp_packets.timestamp;
+		cout << temptime.wYear << "年" << temptime.wMonth << "月" << temptime.wDay << "日";
+		cout << temptime.wHour << "时" << temptime.wMinute << "分" << temptime.wSecond << "秒" << endl;
+		cout << "-----------------------------------------------------" << endl;
+		Sleep(10);
+	}
+
+	cout << "-----*** 对方已成功接收文件！***----- " << endl << endl;
+	delete[] binary_file_buf;
+}
+
+// RSA全局变量
+string e_str, d_str, n_str;   // 公钥{e, n}
+string AES_Key;
+int real_AES_Key[4][4] = { 0 };
+int init_vec[4][4] = { 0 }; // 初始向量目前设置为0
+unsigned int other_user = -1; // 对方用户随机序号
+bool key_verified = false; // !!
+
+// 密钥分配验证过程！！好像要设置成两个函数
+// request先发送RSA公钥，再等待接收AES的密钥
+// 密钥分发验证需要在文件传输之前做
+void key_request(SOCKET& SendSocket) {
+	Sleep(100);
+
+	ifstream fin1("RSA公钥.txt");
+	if (!fin1) {
+		cerr << "---*** RSA公钥读取失败 ***---" << endl;
+	}
+	fin1 >> e_str >> n_str;
+	fin1.close();
+	ifstream fin2("RSA私钥.txt");
+	if (!fin2) {
+		cerr << "---*** RSA私钥读取失败 ***---" << endl;
+	}
+	fin2 >> d_str >> n_str;
+	fin2.close();
+
+	BigInt e = BigInt(e_str.c_str());
+	BigInt d = BigInt(d_str.c_str());
+	BigInt n = BigInt(n_str.c_str());
+
+	// 发送RSA私钥，自身user序号和时间戳
+	string private_key = e_str + '\n' + n_str;
+	// cout << private_key << endl;
+	SYSTEMTIME systime = { 0 };
+	GetLocalTime(&systime);
+	TCP_Message key_packets(KEY, user_name, systime, private_key.c_str());
+	
+	send_packet(key_packets, SendSocket);
+	// 等待接收自身的序列号作为验证
+	unsigned int verify_user = -1;
+	while (1) {
+		int iResult;
+		char* KeyBuf = new char[10]();
+		iResult = recv(SendSocket, KeyBuf, 10, 0);
+		if (iResult == SOCKET_ERROR) {
+			cout << "Recv failed with error: " << WSAGetLastError() << endl;
+		}
+		else {
+			// cout << KeyBuf << endl;
+			verify_user = atoi(KeyBuf);
+			cout << "verify user: " << verify_user << endl;
+			break; 
+		}
+	}
+	// 等待接收密钥和对方的序列号
+	// 验证时间间隔并不长
+	SYSTEMTIME verify_time;
+	while (1) {
+		int iResult;
+		char* KeyBuf = new char[MES_LEN]();
+		TCP_Message temp;
+		iResult = recv(SendSocket, KeyBuf, MES_LEN, 0);
+		if (iResult == SOCKET_ERROR) {
+			cout << "Recv failed with error: " << WSAGetLastError() << endl;
+		}
+		else {
+			memcpy(&temp, KeyBuf, MES_LEN);
+			// cout << temp.user << " " << temp.buffer << endl;
+			other_user = temp.user;
+
+			// RSA解密AES密钥
+			char AES_Key_enc[512] = "";
+			for (int i = 0; i < strlen(temp.buffer); i++) {
+				AES_Key_enc[i] = temp.buffer[i];
+			}
+			BigInt AES_enc = BigInt(AES_Key_enc);
+			BigInt AES_dec;
+			AES_dec = Decrypt(AES_enc, d, n);
+			AES_Key = AES_dec.tostr();
+
+			// 将AES Key存储到文件之中，便于下一次的使用
+			ofstream fout("AESKey.txt");
+			for (int i = 0; i < AES_Key.length(); i++) {
+				if (i % 2 == 1) {
+					fout << AES_Key[i] << " ";
+				}
+				else {
+					fout << AES_Key[i];
+				}
+			}
+			fout.close();
+
+			verify_time = temp.timestamp;
+			cout << "other user: " << other_user << endl;
+			cout << "AES Key: " << AES_Key_enc << endl;
+			cout << "AES Key dec: " << AES_Key << endl;
+			cout << "verify time: ";
+			cout << verify_time.wYear << "年" << verify_time.wMonth << "月" << verify_time.wDay << "日";
+			cout << verify_time.wHour << "时" << verify_time.wMinute << "分" << verify_time.wSecond << "秒" << endl;
+			cout << "-----------------------------------------------------" << endl;
+			break;
+		}
+	}
+
+	if (user_name == verify_user) {
+		if (verify_time.wYear == systime.wYear && verify_time.wMonth == systime.wMonth && verify_time.wDay == systime.wDay
+			&& verify_time.wHour == systime.wHour && (abs(verify_time.wMinute - systime.wMinute) <= 5)) {
+			key_verified = true;
+		}
+		else {
+			cout << "验证超时！！" << endl;
+		}
+	}
+	else {
+		cout << "用户名验证错误！！" << endl;
+	}
+
+	if (key_verified == true) {
+		cout << "已通过密钥分配验证，并成功获取AES密钥" << endl;
+		cout << "-----------------------------------------------------" << endl;
+	}
+	else {
+		cout << "密钥分配验证失败，请重新尝试" << endl;
+		cout << "-----------------------------------------------------" << endl;
+	}
+}
+
+// 直接把接收端的移植过来就可以了
+void key_verify(SOCKET& SendSocket) {
+
+}
+
+int cur_enc_text[4][4]; // AES加密时的窗口
+
+DWORD WINAPI Send(LPVOID lparam_socket) {
+
+	// 接受消息直到quit退出聊天
+	// flag为是否退出聊天的标志
+	int sendResult;
+	SOCKET* sendSocket = (SOCKET*)lparam_socket;
+
+	while (1) {
+		string command;
+		cout << "请输入您的命令：";
+		cin >> command;
+		cout << endl;
+		if (command == "quit") {
+			flag = 0;
+			closesocket(*sendSocket);
+			cout << endl << "即将断开连接" << endl;
+			return 1;
+		}
+		else if(command == "send"){
+			cout << "-----------------------------------------------------" << endl;
+			cout << "请输入想要发送的文件：";
+			string file;
+			cin >> file;
+			clock_t start = clock();
+			send_file(file, *sendSocket);
+			clock_t end = clock();
+			cout << "**传输文件时间为：" << (end - start) / CLOCKS_PER_SEC << "s" << endl;
+			cout << "**吞吐率为:" << ((float)file_size) / ((end - start) / CLOCKS_PER_SEC) << " bytes/s " << endl << endl;
+			continue;
+		}
+
+
+		// 这里就不折磨自己了，用带有数字的测试文件就好了
+		// 可以写到大作业报告之中
+		/*
+		ifstream fin("test.txt", ifstream::binary);
+		fin.seekg(0, std::ifstream::end);
+		long size = fin.tellg();
+		fin.seekg(0);
+		char* binary_file_buf = new char[size];
+		cout << " ** 文件大小：" << size << " bytes" << endl;
+		fin.read(&binary_file_buf[0], size);
+		fin.close();
+
+		// padding填充过程
+		int quotient = size / 128;
+		int remainder = size % 128;
+		int group_num = 0;
+		if (remainder > 0) {
+			group_num = quotient + 1;
+		}
+		else if (remainder == 0) {
+			group_num = quotient;
+		}
+
+		int* ready2enc = new int[16 * group_num];
+		// 全部初始化为0
+		for (int i = 0; i < 16 * group_num; i++) {
+			ready2enc[i] = 0;
+		}
+		for (int i = 0; i < size; i++) {
+			ready2enc[i] = binary_file_buf[i];
+		}
+		// cout << binary_file_buf << endl;
+		for (int i = 0; i < 16 * group_num; i++) {
+			cout << ready2enc[i] << " ";
+		}
+		cout << endl;
+
+		// 加密轮数即为group num
+		int** to_enc = new int* [4];
+		for (int i = 0; i < 4; i++) {
+			to_enc[i] = new int[4 * group_num];
+		}
+		int count = 0; // 一维数组的计数器
+		for (int i = 0; i < 4 * group_num; i++) {
+			for (int j = 0; j < 4; j++) {
+				to_enc[j][i] = ready2enc[count];
+				count++;
+			}
+		}
+		// 输出测试
+		for (int i = 0; i < 4 * group_num; i++) {
+			for (int j = 0; j < 4; j++) {
+				cout << to_enc[j][i] << " ";
+			}
+		}
+		cout << endl;
+
+		int temp_key[4][4];
+		cout << "输入密钥(binary 128 -> hex 16): ";
+		for (int i = 0; i < 4; i++) {
+			for (int j = 0; j < 4; j++) {
+				cin >> (hex) >> temp_key[j][i];
+			}
+		}
+		for (int i = 0; i < group_num; i++) {
+			// 初始向量设置为全1，每次加密前设置cur enc text
+			for (int j = 4 * i; j < 4 * (i + 1); j++) {
+				for (int k = 0; k < 4; k++) {
+					cur_enc_text[k][j % 4] = to_enc[k][j] ^ cur_enc_text[k][j % 4];
+				}
+			}
+			Encode(cur_enc_text, temp_key);
+			// 去给它填回text数组里面去
+			for (int j = 4 * i; j < 4 * (i + 1); j++) {
+				for (int k = 0; k < 4; k++) {
+					to_enc[k][j] = cur_enc_text[k][j % 4];
+				}
+			}
+		}
+		for (int i = 0; i < 4 * group_num; i++) {
+			for (int j = 0; j < 4; j++) {
+				// cout << "0x";
+				if (to_enc[j][i] < 16)
+					cout << "0";
+				cout << hex << setiosflags(ios::uppercase) << setfill('0') << setw(1) << to_enc[j][i] << " ";
+			}
+
+		}
+		cout << endl;
+		*/	
+
+
+		// real_AES_Key
+		else if (command == "encrypt") {
+			// cur enc text初始化
+			for (int i = 0; i < 4; i++) {
+				for (int j = 0; j < 4; j++) {
+					cur_enc_text[j][i] = 0;
+				}
+			}
+
+			// 加载AES密钥
+			ifstream fin("AESKey.txt");
+			for (int i = 0; i < 4; i++) {
+				for (int j = 0; j < 4; j++) {
+					fin >> hex >> real_AES_Key[j][i];
+				}
+			}
+			fin.close();
+
+			string filename;
+			cout << "请输入想要AES加密的文件：";
+			cin >> filename;
+
+			// 获取文件大小，纯粹的偷懒，只是通过特定的文件来获取分组数目
+			// 完整的实际文件处理以及padding见实验报告
+			ifstream fin0(filename, ifstream::binary);
+			fin0.seekg(0, std::ifstream::end);
+			long size = fin0.tellg();
+			fin0.seekg(0);
+			cout << "文件大小：" << size << " bytes" << endl;
+			fin0.close();
+
+			int group_num = size / 48;
+			cout << "分组数目：" << group_num << endl;
+
+			// 加密轮数即为group num
+			int** to_enc = new int* [4];
+			for (int i = 0; i < 4; i++) {
+				to_enc[i] = new int[4 * group_num];
+			}
+			ifstream fin1(filename);
+			for (int i = 0; i < 4 * group_num; i++) {
+				for (int j = 0; j < 4; j++) {
+					fin1 >> (hex) >> to_enc[j][i];
+				}
+			}
+			fin1.close();
+
+			// 输出测试
+			for (int i = 0; i < 4 * group_num; i++) {
+				for (int j = 0; j < 4; j++) {
+					if (to_enc[j][i] < 16)
+						cout << "0";
+					cout << hex << to_enc[j][i] << " ";
+				}
+			}
+			cout << endl;
+
+			// 开始加密
+			for (int i = 0; i < group_num; i++) {
+				// 初始向量设置为全1，每次加密前设置cur enc text
+				for (int j = 4 * i; j < 4 * (i + 1); j++) {
+					for (int k = 0; k < 4; k++) {
+						cur_enc_text[k][j % 4] = to_enc[k][j] ^ cur_enc_text[k][j % 4];
+					}
+				}
+				Encode(cur_enc_text, real_AES_Key);
+				// 去给它填回text数组里面去
+				for (int j = 4 * i; j < 4 * (i + 1); j++) {
+					for (int k = 0; k < 4; k++) {
+						to_enc[k][j] = cur_enc_text[k][j % 4];
+					}
+				}
+			}
+
+			// 查看加密后的数据
+			for (int i = 0; i < 4 * group_num; i++) {
+				for (int j = 0; j < 4; j++) {
+					// cout << "0x";
+					if (to_enc[j][i] < 16)
+						cout << "0";
+					cout << hex << to_enc[j][i] << " ";
+				}
+			}
+			cout << endl << endl;
+			cout << "-----------------------------------------------------" << endl;
+
+			// 将加密数据使用文件形式存储，体现加密传输流程的完整性，也可以直接加密完就传输
+			// 这个文件名也能够进行优化，干不动了
+			ofstream fout1("test(enc).txt");
+			for (int i = 0; i < 4 * group_num; i++) {
+				for (int j = 0; j < 4; j++) {
+					if (to_enc[j][i] < 16)
+						fout1 << "0";
+					fout1 << hex << to_enc[j][i] << " ";
+				}
+				if ((i % 4) == 3) {
+					fout1 << endl;
+				}
+			}
+			fout1.close();
+
+		}
+		else if (command == "decrypt") {
+			// cur enc text初始化
+			for (int i = 0; i < 4; i++) {
+				for (int j = 0; j < 4; j++) {
+					cur_enc_text[j][i] = 0;
+				}
+			}
+
+			// 加载AES密钥
+			ifstream fin("AESKey.txt");
+			for (int i = 0; i < 4; i++) {
+				for (int j = 0; j < 4; j++) {
+					fin >> hex >> real_AES_Key[j][i];
+				}
+			}
+			fin.close();
+
+			string filename;
+			cout << "请输入想要AES加密的文件：";
+			cin >> filename;
+
+			// 获取文件大小，纯粹的偷懒，只是通过特定的文件来获取分组数目
+			// 完整的实际文件处理以及padding见实验报告
+			ifstream fin0(filename, ifstream::binary);
+			fin0.seekg(0, std::ifstream::end);
+			long size = fin0.tellg();
+			fin0.seekg(0);
+			cout << "文件大小：" << size << " bytes" << endl;
+			fin0.close();
+
+			int group_num = size / 48;
+			cout << "分组数目：" << group_num << endl;
+
+			// 开始解密并存储为文件的形式
+			// 初始化解密时上一次的4*4的密文
+			int** to_dec = new int* [4];
+			for (int i = 0; i < 4; i++) {
+				to_dec[i] = new int[4 * group_num];
+			}
+			ifstream fin1(filename);
+			for (int i = 0; i < 4 * group_num; i++) {
+				for (int j = 0; j < 4; j++) {
+					fin1 >> hex >> to_dec[j][i];
+				}
+			}
+			fin1.close();
+
+			// 输出测试
+			for (int i = 0; i < 4 * group_num; i++) {
+				for (int j = 0; j < 4; j++) {
+					if (to_dec[j][i] < 16)
+						cout << "0";
+					cout << hex << to_dec[j][i] << " ";
+				}
+			}
+			cout << endl;
+
+			int last_enc[4][4];
+			for (int i = 0; i < 4; i++) {
+				for (int j = 0; j < 4; j++) {
+					last_enc[j][i] = 0;
+				}
+			}
+			for (int i = 0; i < group_num; i++) {
+				// 初始向量设置为全1，每次加密前设置cur enc text
+				int temp[4][4] = { 0 };
+				for (int j = 4 * i; j < 4 * (i + 1); j++) {
+					for (int k = 0; k < 4; k++) {
+						cur_enc_text[k][j % 4] = to_dec[k][j];
+						temp[k][j % 4] = to_dec[k][j];
+					}
+				}
+				Decode(cur_enc_text, real_AES_Key);
+				// 去给它填回text数组里面去
+				for (int j = 4 * i; j < 4 * (i + 1); j++) {
+					for (int k = 0; k < 4; k++) {
+						to_dec[k][j] = cur_enc_text[k][j % 4] ^ last_enc[k][j % 4];
+					}
+				}
+				// 更新last enc也就是更新上一次的密文
+				for (int j = 0; j < 4; j++) {
+					for (int k = 0; k < 4; k++) {
+						last_enc[k][j] = temp[k][j];
+					}
+				}
+			}
+
+			for (int i = 0; i < 4 * group_num; i++) {
+				for (int j = 0; j < 4; j++) {
+					// cout << "0x";
+					if (to_dec[j][i] < 16)
+						cout << "0";
+					cout << hex << to_dec[j][i] << " ";
+				}
+			}
+			cout << endl << endl;
+			cout << "-----------------------------------------------------" << endl;
+
+			// 存储解密文件
+			// 同样对于文件名可以进行优化
+			ofstream fout1("test(dec).txt");
+			for (int i = 0; i < 4 * group_num; i++) {
+				for (int j = 0; j < 4; j++) {
+					if (to_dec[j][i] < 16)
+						fout1 << "0";
+					fout1 << hex << to_dec[j][i] << " ";
+				}
+				if ((i % 4) == 3) {
+					fout1 << endl;
+				}
+			}
+			fout1.close();
+		}
+		else {
+			cout << "Error command!!" << endl;
+			continue;
+		}
+	}
+}
+
+int main() {
+	// 这块儿现改成随机分配一个user name吧，然后就用这个随机的user name来做验证的一部分
+	srand((unsigned)time(NULL));
+	user_name = rand() % 100;
+
+	/*-------------------------- TCP密钥分发，验证，通讯部分 --------------------------*/
+	//----------------------
+	//使用iResult的值来表征各个步骤是否操作成功
+	int iResult;
+	WSADATA wsaData;
+	SOCKET ConnectSocket = INVALID_SOCKET;
+
+	int recvbuflen = DEFAULT_BUFLEN;
+	int sendbuflen = DEFAULT_BUFLEN;
+
+	//----------------------
+	// 初始化 Winsock,输出信息详细描述
+	iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+	if (iResult != NO_ERROR) {
+		cout << "WSAStartup failed with error: " << iResult << endl;
+		return 1;
+	}
+
+	//----------------------
+	// 客户端创建SOCKET内存来连接到服务端
+	ConnectSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (ConnectSocket == INVALID_SOCKET) {
+		cout << "Socket failed with error: " << WSAGetLastError() << endl;
+		WSACleanup();
+		return 1;
+	}
+
+	//----------------------
+	// 创建sockaddr_in结构，再转换成SOCKADDR的结构
+	// 要连接的服务端的IP地址、端口号
+	struct sockaddr_in clientService;
+	clientService.sin_family = AF_INET;
+	inet_pton(AF_INET, DEFAULT_IP, &clientService.sin_addr.s_addr);
+	clientService.sin_port = htons(DEFAULT_PORT);
+
+	//----------------------
+	// Connect连接到服务端
+	iResult = connect(ConnectSocket, (SOCKADDR*)&clientService, sizeof(clientService));
+	if (iResult == SOCKET_ERROR) {
+		cout << "Connect failed with error: " << WSAGetLastError() << endl;
+		closesocket(ConnectSocket);
+		WSACleanup();
+		return 1;
+	}
+
+	// 打印进入聊天的标志
+	cout << "              Welcome    User    " << user_name << endl;
+	cout << "*****************************************************" << endl;
+	cout << "             Use quit command to quit" << endl;
+	cout << "-----------------------------------------------------" << endl;
+
+	// 必须先进行密钥的验证分发
+	while (1) {
+		cout << endl << "Use request or verify command to verify the key: ";
+		string s;
+		cin >> s;
+		if (s == "request") {
+			key_request(ConnectSocket);
+			break;
+		}
+		else if (s == "verify") {
+			key_verify(ConnectSocket);
+			break;
+		}
+		else {
+			cout << "Error request!! Please restart" << endl;
+			continue;
+		}
+	}
+
+	//----------------------
+	// 创建两个线程，一个接受线程，一个发送线程
+	HANDLE hThread[2];
+	hThread[0] = CreateThread(NULL, 0, Recv, (LPVOID)&ConnectSocket, 0, NULL);
+	hThread[1] = CreateThread(NULL, 0, Send, (LPVOID)&ConnectSocket, 0, NULL);
+
+	WaitForMultipleObjects(2, hThread, TRUE, INFINITE);
+	CloseHandle(hThread[0]);
+	CloseHandle(hThread[1]);
+
+	// 关闭socket
+	iResult = closesocket(ConnectSocket);
+	WSACleanup();
+	return 0;
+
+
+
+	/*
+	// 已经生成过了RSA Key
+	// Gen_Key_File();
+	
+	string e_str, d_str, n_str;
+	// 读取RSA公钥和私钥文件内容
+	ifstream fin1("RSA公钥.txt");
+	if (!fin1) {
+		cerr << "---*** RSA公钥读取失败 ***---" << endl;
+		return -1;
+	}
+	fin1 >> e_str >> n_str;
+	fin1.close();
+
+	ifstream fin2("RSA私钥.txt");
+	if (!fin2) {
+		cerr << "---*** RSA私钥读取失败 ***---" << endl;
+		return -1;
+	}
+	fin2 >> d_str >> n_str;
+	fin2.close();
+
+	cout << e_str << endl << d_str << endl << n_str << endl;
+	cout << endl;
+
+	BigInt e = BigInt(e_str.c_str());
+	BigInt d = BigInt(d_str.c_str());
+	BigInt n = BigInt(n_str.c_str());
+	e.print();
+	cout << endl;
+	d.print();
+	cout << endl;
+	n.print();
+
+
+	cout << "\n===================================正在随机生成明文====================================\n\n";
+	cout << "明文m: \n";
+	BigInt m = BigInt("12345678");
+	// GenOdd(m);
+	m.print();
+
+	cout << "\n=======================================正在加密========================================\n\n";
+	cout << "加密得到的密文: \n";
+	BigInt c;
+	c = Encrypt(m, e, n);
+	c.print();
+	
+	cout << "\n=======================================正在解密========================================\n\n";
+	cout << "解密得到的明文: \n";
+	BigInt m_;
+	m_ = Decrypt(c, d, n);
+	m_.print();
+	*/
+}
