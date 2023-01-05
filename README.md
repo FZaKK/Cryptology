@@ -1,5 +1,5 @@
-# cryptology
-cryptology course in NKU
+# Cryptology
+Cryptology course in NKU
 
 1. 目前已经全部完成，可以直接使用测试文件文件夹来进行测试，可以使用的指令为encrypt（AES加密）、decrypt（AES解密）、send（发送文件）、quit（退出程序）、request（向对方请求AES密钥，并发送RSA公钥）和verify（响应，验证request请求）
 2. 对于通讯双方而言，唯一的不同点就是request请求的发送方是可以不同的，当一方发送request命令后，那么本次通讯双方的AES密钥就是接收方的AES密钥，但是双方都是可以进行AES加密、解密以及双向通讯发送的。
